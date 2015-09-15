@@ -4,9 +4,9 @@ Gem::Specification.new do |s|
   s.licenses = ["Apache License (2.0)"]
   s.summary = "This output will send events to ceph object storage and be robust to network and node failure."
   s.description = "This gem is a logstash plugin required to be installed on top of the Logstash core pipeline using $LS_HOME/bin/plugin install gemname. This gem is not a stand-alone program"
-  s.authors = ["Fan Liang"]
-  s.email = "chcdlf@gmail.com"
-  s.homepage = "https://github.com/liangfan"
+  s.authors = ["Yongqiang He", "Fan Liang"]
+  s.email = ""
+  s.homepage = ""
   s.require_paths = ["lib"]
 
   # Files
@@ -19,6 +19,7 @@ Gem::Specification.new do |s|
 
   # Gem dependencies
   s.add_runtime_dependency "logstash-core", ">= 1.4.0", "< 2.0.0"
+  s.add_runtime_dependency "aws-sdk", "~> 2"
  
   s.add_development_dependency "logstash-devutils"
 end

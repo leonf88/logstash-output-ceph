@@ -1,8 +1,7 @@
 # encoding: utf-8
 require "logstash/outputs/base"
 require "logstash/namespace"
-
-require "mem_event_queue"
+require "logstash/outputs/mem_event_queue"
 
 # This output will send events to the Ceph storage system.
 # Besides, it provides the buffer store, like Facebook
@@ -41,7 +40,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   config :message_format, :validate => :string
 
   # Set the size per file.
-  config :max_file_size_mb, :validate => :number, :default => 4 * (2**20)
+  config :max_file_size_mb, :validate => :number, :default => 4
 
   # Force flush data from memory to disk if 
   # 1. total in-memory data reached max_mem_mb And
@@ -89,6 +88,12 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
   #######################################
 
+  # S3 bucket
+  config :bucket, :validate => :string
+
+  # AWS endpoint_region
+  config :endpoint_region, :validate => [], :deprecated => 'Deprecated, use region instead.'
+
   # initialize the output
   public
   def register
@@ -109,9 +114,13 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     
     @max_file_size = @max_file_size_mb * 1024 * 1024
 
+    # TODO
+    @file_counter = 0
+
     # A map from partitions to event queue
     @part_to_events = {}
     @part_to_events_lock = Mutex.new
+    @part_to_events_condition = ConditionVariable.new
 
     @local_file_path = File.expand_path(@local_file_path)
     add_existing_disk_files()
@@ -120,6 +129,8 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     start_queue_mover()
     start_upload_workers()
     start_flush_workers()
+    print "start over"
+    p @total_mem_size
   end
 
   public
@@ -142,10 +153,10 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     else
       # Scan the folder and load all existing files.
       cwd = Dir.pwd
-      Dir.chdir(@local_file_path)
+      Dir.chdir(@local_file_path) # multi-threaded program may throw an error
       Dir.glob(File.join(@local_file_path, "**", "*")).each do |file_name|
-      @file_queue << file_name if !File.directory? file_name
-      @total_disk_size += File.size(file_name)
+        @file_queue << file_name if !File.directory? file_name
+        @total_disk_size += File.size(file_name)
       end
       Dir.chdir(cwd)
     end
@@ -155,11 +166,14 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   def start_queue_mover()
     @move_queue_thread = Thread.new {
       loop do
-        part_to_events_lock.synchronize {
+        @part_to_events_lock.synchronize {
+          p @part_to_events.size
           @part_to_events.each do |part, event_queue|
+            p event_queue.seconds_since_first_event, @seconds_before_new_file
             if event_queue.seconds_since_first_event > @seconds_before_new_file || event_queue.total_size >= @max_file_size
+              p "flush a queue"
               @to_flush_queue << event_queue
-              part_to_events.delete(partitions)
+              @part_to_events.delete(part)
             end
           end
         }
@@ -171,11 +185,11 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   public
   def start_flush_workers()
     @flush_workers =[]
-    if @flush_workers <= 0
-      @flush_workers = 1
+    if @flush_worker_num == 0
+      @flush_worker_num = 1
     end
 
-    @flush_workers.times do
+    @flush_worker_num.times do
       @flush_workers << Thread.new {flush_worker()}
     end
   end
@@ -183,7 +197,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   public
   def start_upload_workers()
     @upload_workers = []
-    if @upload_worker_num <= 0
+    if @upload_worker_num == 0
       @upload_worker_num = 1
     end
 
@@ -193,6 +207,98 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   public
+  def receive(event)
+    return unless output?(event)
+
+    # @buffer_items << format_message(event)
+    
+    # use json format to calculate partitions and event size.
+    json_event = event.to_json
+
+    if @partition_fields
+      partitions = get_partitions(json_event)
+    else
+      partitions = [""]
+    end
+    
+    # Block when the total mem size reached up limit.
+    wait_for_mem
+
+    @part_to_events_lock.synchronize {
+      if ! @part_to_events.has_key?(partitions)
+        @part_to_events[partitions] = MemEventQueue.new(partitions)
+      end
+      event_queue = @part_to_events.fetch(partitions)
+      # p partitions.id, event_queue.seconds_since_first_event, @seconds_before_new_file
+       p event_queue.seconds_since_first_event, @seconds_before_new_file
+      if event_queue.seconds_since_first_event > @seconds_before_new_file || event_queue.total_size >= @max_file_size
+        @to_flush_queue << event_queue
+        event_queue = MemEventQueue.new(partitions)
+        @part_to_events[partitions] = event_queue
+      end
+
+      p "push event"
+      event_queue.push(event, json_event.size)
+      @total_mem_size += json_event.size
+    }
+
+  end # def event
+
+  public
+  def wait_for_mem()
+    @part_to_events_lock.synchronize {
+      while @total_mem_size >= @max_mem_size
+        if @to_flush_queue.empty?
+          # wait for the flush
+          @part_to_events_condition.wait(@part_to_events_lock)
+        else
+          # WARN: rarely can execute here
+          # flush the latest partition, the time may not be accurate if the queue is too large
+          latest_partition = @part_to_events.max_by { |part, event_queue| event_queue.seconds_since_first_event }
+          @to_flush_queue << latest_partition[1]
+          @part_to_events.delete(latest_partition[0])
+        end
+      end
+    }
+  end
+
+  public
+  def get_partitions(json_event)
+    ret = []
+    @partition_fields.each do |part|
+      ret << part + "=" + json_event[part]
+    end
+  end
+
+  # flush the memory events on local disk
+  private
+  def flush_worker()
+    loop do
+      event_queue = @to_flush_queue.deq
+      p "get a queue"
+      partition_dir = @local_file_path
+      event_queue.partitions.each do |part|
+        partition_dir = File.join(partition_dir, part)
+      end
+
+      if !Dir.exists?(partition_dir)
+        @logger.info("Create directory", :directory => partition_dir)
+        FileUtils.mkdir_p(partition_dir)
+      end
+      p partition_dir
+
+      #flush data to disk.
+      @file_queue << write_to_tempfile(event_queue.event_queue(), partition_dir)
+
+      @part_to_events_lock.synchronize {
+        @total_mem_size -= event_queue.total_size
+        @part_to_events_condition.signal
+      }
+    end
+  end
+
+  # upload the local temporary files to ceph
+  private
   def upload_worker()
     loop do
       file = @file_queue.deq
@@ -203,59 +309,15 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
           break
         else
           @logger.debug("Ceph: upload working is uploading a new file", :filename => File.basename(file))
-          buffer_flush(file)
+          move_file_to_bucket(file)
       end
     end
   end
-  
-  public
-  def receive(event)
-    return unless output?(event)
 
-    @buffer_items << format_message(event)
-    
-    # use json format to calculate partitions and event size.
-    json_event = event.to_json
-    partitions = []
-    if partition_fields
-      partitions = get_partitions(json_event)
-    else
-      partitions = [""]
-    end
-    
-    # Block when the total mem size reached up limit.
-    wait_for_mem()
-
-    part_to_events_lock.synchronize {
-      event_queue = @part_to_events.fetch(partitions, MemEventQueue.new(partitions))
-      if event_queue.seconds_since_first_event > @seconds_before_new_file || event_queue.total_size >= @max_file_size
-        @to_flush_queue << event_queue
-        event_queue = MemEventQueue.new(partitions)
-        @part_to_events[partitions] = event_queue
-      end
-
-      event_queue.push(event, json_event.size)
-      @total_mem_size += json_event.size
-    }
-
-  end # def event
-
-  #TODO
-  public
-  def wait_for_mem()
-    
-  end
-
-  public
-  def get_partitions(event)
-    ret = []
-    @partition_fields.each do |part|
-      ret << part + "=" + json_event[part]
-    end
-  end
-
+  # flush the local files to ceph storage
+  # if success, delete the local file, otherwise, retry
   private
-  def buffer_flush(file)
+  def move_file_to_bucket(file)
     begin
       if !File.zero?(file)
         upload_file(file)
@@ -276,34 +338,14 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     end
   end
 
-  #TODO
   private
-  def flush_worker()
-    loop do
-      event_queue = @to_flush_queue.deq
-      partition_dir = @local_file_path
-      event_queue.partitions.each do |part|
-        partition_dir = File.join(partition_dir, part)
-      end
-
-      if !Dir.exists?(@partition_dir)
-        @logger.info("Create directory", :directory => @partition_dir)
-        FileUtils.mkdir_p(@partition_dir)
-      end
-
-      #flush data to disk.
-
-      @total_mem_size -= event_queue.total_size()
-    end
-  end
-
-  private
-  def write_to_tempfile(buffer_items)
-    fd = create_temporary_file
+  def write_to_tempfile(events, dir)
+    filename = create_temporary_file(dir)
+    fd = File.open(filename, "w")
     begin
       @logger.debug("Ceph: put events into tempfile ", :file => File.basename(fd.path))
-      buffer_items.each do |msg|
-        fd.syswrite(msg)
+      while ! events.empty?
+        fd.syswrite(format_message(events.pop(non_block = true)))
       end
     rescue Errno::ENOSPC
       @logger.error("Ceph: No space left in temporary directory", :local_file_path => @local_file_path)
@@ -325,12 +367,12 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   private
-  def create_temporary_file
+  def create_temporary_file(dir)
     current_time = Time.now
-    file_path = File.join(@local_file_path, "ceph.store.#{current_time.strftime("%Y-%m-%dT%H.%M")}.part#{@file_counter}")
-    @logger.info("Opening file", :path => file_path)
+    filename = File.join(dir, "ceph.store.#{current_time.strftime("%Y-%m-%dT%H.%M")}.part#{@file_counter}")
+    @logger.info("Opening file", :path => filename)
     @file_counter += 1
 
-    return File.open(file_path, "w")
+    return filename
   end
 end
