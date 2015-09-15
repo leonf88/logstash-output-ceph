@@ -99,6 +99,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   def register
     require "thread"
 
+    @shutdown = false
     # Queue of queue of events to flush to disk.
     @to_flush_queue = Queue.new
     # Queue of files to upload.
@@ -135,14 +136,33 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
   public
   def teardown(force = false)
+    @shutdown = true
     if force
-      @logger.debug("Ceph: shutdown the upload worker forcefully.")
-      @upload_worker.stop
+      @logger.debug("Shutdown the flush workers forcefully.")
+      @flush_workers.each do |worker|
+        worker.stop
+      end
+
+      @logger.debug("Shutdown the queue move worker forcefully.")
+      @move_queue_thread.stop
+
+      @logger.debug("Shutdown the upload workers forcefully.")
+      @upload_workers.each do |worker|
+        worker.stop
+      end
+
     else
-      @logger.debug("Ceph: gracefully shutdown the upload worker.")
-      @file_queue << LogStash::ShutdownEvent
-      @upload_worker.join
+      @logger.debug("Gracefully shutdown the upload worker.")
     end
+
+    @flush_workers.each do |worker|
+      worker.join
+    end
+    @move_queue_thread.join
+    @upload_workers.each do |worker|
+      worker.stop
+    end
+
   end
 
   private
@@ -165,7 +185,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   private
   def start_queue_mover()
     @move_queue_thread = Thread.new {
-      loop do
+      while !@shutdown
         @part_to_events_lock.synchronize {
           p @part_to_events.size
           @part_to_events.each do |part, event_queue|
@@ -264,7 +284,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   # flush the memory events to local disk
   private
   def flush_worker()
-    loop do
+    while !@shutdown
       event_queue = @to_flush_queue.deq
       p "get a queue"
       partition_dir = @local_file_path
@@ -291,7 +311,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   # upload the local temporary files to ceph
   private
   def upload_worker()
-    loop do
+    while !@shutdown
       file = @file_queue.deq
 
       case file
