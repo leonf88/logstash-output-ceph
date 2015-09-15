@@ -66,7 +66,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   config :retry_interval, :validate => :number, :default => 5
 
   # Set the file suffix. 
-  config :file_suffix, :validate => :string, :default => ""
+  config :file_suffix, :validate => :string, :default => "txt"
 
   # Set the root bucket to upload data.
   config :upload_root_bucket, :validate => :string, :default=> "data"
@@ -145,7 +145,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     end
   end
 
-  public
+  private
   def add_existing_disk_files()
     if !Dir.exists?(@local_file_path)
       @logger.info("Create directory", :directory => @local_file_path)
@@ -162,7 +162,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     end
   end
 
-  public
+  private
   def start_queue_mover()
     @move_queue_thread = Thread.new {
       loop do
@@ -182,7 +182,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     }
   end
 
-  public
+  private
   def start_flush_workers()
     @flush_workers =[]
     if @flush_worker_num == 0
@@ -194,7 +194,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     end
   end
 
-  public
+  private
   def start_upload_workers()
     @upload_workers = []
     if @upload_worker_num == 0
@@ -244,25 +244,16 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
   end # def event
 
-  public
+  private
   def wait_for_mem()
     @part_to_events_lock.synchronize {
       while @total_mem_size >= @max_mem_size
-        if @to_flush_queue.empty?
-          # wait for the flush
           @part_to_events_condition.wait(@part_to_events_lock)
-        else
-          # WARN: rarely can execute here
-          # flush the latest partition, the time may not be accurate if the queue is too large
-          latest_partition = @part_to_events.max_by { |part, event_queue| event_queue.seconds_since_first_event }
-          @to_flush_queue << latest_partition[1]
-          @part_to_events.delete(latest_partition[0])
-        end
       end
     }
   end
 
-  public
+  private
   def get_partitions(json_event)
     ret = []
     @partition_fields.each do |part|
@@ -270,7 +261,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     end
   end
 
-  # flush the memory events on local disk
+  # flush the memory events to local disk
   private
   def flush_worker()
     loop do
@@ -288,7 +279,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
       p partition_dir
 
       #flush data to disk.
-      @file_queue << write_to_tempfile(event_queue.event_queue(), partition_dir)
+      @file_queue << write_to_tempfile(event_queue, partition_dir)
 
       @part_to_events_lock.synchronize {
         @total_mem_size -= event_queue.total_size
@@ -339,8 +330,10 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   private
-  def write_to_tempfile(events, dir)
-    filename = create_temporary_file(dir)
+  def write_to_tempfile(event_q, dir)
+    events = event_q.event_queue
+    create_ts = event.begin_ts
+    filename = create_temporary_file(dir, create_ts)
     fd = File.open(filename, "w")
     begin
       @logger.debug("Ceph: put events into tempfile ", :file => File.basename(fd.path))
@@ -367,11 +360,10 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   private
-  def create_temporary_file(dir)
-    current_time = Time.now
-    filename = File.join(dir, "ceph.store.#{current_time.strftime("%Y-%m-%dT%H.%M")}.part#{@file_counter}")
+  def create_temporary_file(dir, ts)
+    require 'securerandom'
+    filename = File.join(dir, "#{ts.strftime("%Y-%m-%dT%H.%M")}_#{SecureRandom.uuid}.#{@file_suffix}")
     @logger.info("Opening file", :path => filename)
-    @file_counter += 1
 
     return filename
   end
