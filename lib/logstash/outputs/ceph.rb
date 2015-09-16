@@ -5,6 +5,8 @@ require "logstash/namespace"
 require "logstash/outputs/ceph_helper"
 require "logstash/outputs/mem_event_queue"
 require "securerandom"
+require "json"
+require 'pathname'
 
 # This output will send events to the Ceph storage system.
 # Besides, it provides the buffer store, like Facebook
@@ -85,8 +87,9 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   def create_bucket(bktname)
     bucket = @s3.bucket(bktname)
     if ! bucket.exists?
+      @logger.debug("Creating bucket", :bucket => bktname)
       @s3.create_bucket(:bucket => bktname)
-      @logger.debug("Create bucket", :bucket => bktname)
+      @logger.debug("Created bucket", :bucket => bktname)
     end
   end
 
@@ -96,22 +99,29 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   private
-  def upload_file(file)
-    remote_filename = "#{File.basename(file)}"
+  def get_remote_bucket_key(local_file)
+    basefile_name = File.basename(local_file)
+    relative_path = Pathname.new(local_file).relative_path_from(Pathname.new(@local_file_path))
+    return relative_path.to_s
+  end
 
-    @logger.debug("Ceph: ready to write file in bucket", :file => file, :remote_filename => remote_filename, :bucket => @bucket)
+  private
+  def upload_file(local_file)
+    remote_bucket_key = get_remote_bucket_key(local_file)
+
+    @logger.debug("Ceph: ready to write file in bucket", :local_file => local_file, :remote_bucket_key => remote_bucket_key)
 
     begin
       # prepare for write the file
       # TODO: how about the acl?
-      obj = @s3.bucket(@bucket).object(remote_filename)
-      obj.upload_file(file)
+      obj = @s3.bucket(@bucket).object(remote_bucket_key)
+      obj.upload_file(local_file)
     rescue AWS::Errors::Base => error
       @logger.error("Ceph: AWS error", :error => error)
       raise LogStash::Error, "AWS Configuration Error, #{error}"
     end
 
-    @logger.debug("Ceph: has written remote file in bucket.", :remote_filename => remote_filename, :bucket  => @bucket)
+    @logger.debug("Ceph: has written remote file in bucket.", :remote_bucket_key  => remote_bucket_key)
   end
 
   ########################################
@@ -254,15 +264,15 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     return unless output?(event)
 
     # use json format to calculate partitions and event size.
-    json_event = event.to_json
+    msg = event.sprintf("%{message}")
 
     if @partition_fields
-      partitions = get_partitions(json_event)
+      partitions = get_partitions(msg)
     else
       partitions = [""]
     end
 
-    @logger.debug("received one event")    
+    @logger.debug("received one event", :partitions => partitions)    
     # Block when the total mem size reached up limit.
     wait_for_mem
 
@@ -278,8 +288,8 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
       end
 
       @logger.debug("push one event", :partition => partitions)
-      event_queue.push(event, json_event.size)
-      @total_mem_size += json_event.size
+      event_queue.push(event, msg.size)
+      @total_mem_size += msg.size
     }
 
   end # def event
@@ -294,11 +304,15 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   private
-  def get_partitions(json_event)
+  def get_partitions(msg)
     ret = []
+    json_event = JSON.parse(msg)
     @partition_fields.each do |part|
-      ret << part + "=" + json_event[part]
+      partition = part + "=" + json_event[part]
+      @logger.debug("get one partition for event.", :partition => partition)
+      ret << partition
     end
+    return ret
   end
 
   # flush the memory events to local disk
@@ -340,7 +354,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
           @logger.debug("Ceph: upload worker is shutting down gracefuly")
           break
         else
-          @logger.debug("Ceph: upload working is uploading a new file", :filename => File.basename(file))
+          @logger.debug("Ceph: upload working is uploading a new file", :file => file)
           move_file_to_bucket(file)
       end
     end
