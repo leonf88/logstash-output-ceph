@@ -41,7 +41,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
   # If this setting is omitted, the full json representation of the
   # event will be written as a single line.
-  config :message_format, :validate => :string
+  config :message_format, :validate => :string, :default => "%{message}"
 
   # Set the size per file.
   config :max_file_size_mb, :validate => :number, :default => 4
@@ -95,10 +95,11 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     @s3 = Aws::S3::Resource.new(aws_options_hash)
   end
 
+  private
   def upload_file(file)
     remote_filename = "#{File.basename(file)}"
 
-    @logger.debug("Ceph: ready to write file in bucket", :remote_filename => remote_filename, :bucket => @bucket)
+    @logger.debug("Ceph: ready to write file in bucket", :file => file, :remote_filename => remote_filename, :bucket => @bucket)
 
     begin
       # prepare for write the file
@@ -155,8 +156,6 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     start_queue_mover()
     start_upload_workers()
     start_flush_workers()
-    print "start over"
-    p @total_mem_size
   end
 
   public
@@ -209,16 +208,15 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
   private
   def start_queue_mover()
+    @logger.info("Starting queue mover thread.")
     @move_queue_thread = Thread.new {
       while !@shutdown
         @part_to_events_lock.synchronize {
-          p @part_to_events.size
           @part_to_events.each do |part, event_queue|
-            p event_queue.seconds_since_first_event, @seconds_before_new_file
             if event_queue.seconds_since_first_event > @seconds_before_new_file || event_queue.total_size >= @max_file_size
-              p "flush a queue"
               @to_flush_queue << event_queue
               @part_to_events.delete(part)
+              @logger.info("moved one queue to to_flush_queu", :part => part)
             end
           end
         }
@@ -255,8 +253,6 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   def receive(event)
     return unless output?(event)
 
-    # @buffer_items << format_message(event)
-    
     # use json format to calculate partitions and event size.
     json_event = event.to_json
 
@@ -265,7 +261,8 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     else
       partitions = [""]
     end
-    
+
+    @logger.debug("received one event")    
     # Block when the total mem size reached up limit.
     wait_for_mem
 
@@ -274,15 +271,13 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
         @part_to_events[partitions] = MemEventQueue.new(partitions)
       end
       event_queue = @part_to_events.fetch(partitions)
-      # p partitions.id, event_queue.seconds_since_first_event, @seconds_before_new_file
-       p event_queue.seconds_since_first_event, @seconds_before_new_file
       if event_queue.seconds_since_first_event > @seconds_before_new_file || event_queue.total_size >= @max_file_size
         @to_flush_queue << event_queue
         event_queue = MemEventQueue.new(partitions)
         @part_to_events[partitions] = event_queue
       end
 
-      p "push event"
+      @logger.debug("push one event", :partition => partitions)
       event_queue.push(event, json_event.size)
       @total_mem_size += json_event.size
     }
@@ -309,19 +304,19 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   # flush the memory events to local disk
   private
   def flush_worker()
+    @logger.info("Starting one flush worker thread.")
     while !@shutdown
       event_queue = @to_flush_queue.deq
-      p "get a queue"
       partition_dir = @local_file_path
       event_queue.partitions.each do |part|
         partition_dir = File.join(partition_dir, part)
       end
 
+      @logger.debug("Get a queue in flush worker.", :partition_dir => partition_dir)
       if !Dir.exists?(partition_dir)
         @logger.info("Create directory", :directory => partition_dir)
         FileUtils.mkdir_p(partition_dir)
       end
-      p partition_dir
 
       #flush data to disk.
       @file_queue << write_to_tempfile(event_queue, partition_dir)
@@ -336,6 +331,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   # upload the local temporary files to ceph
   private
   def upload_worker()
+    @logger.info("Starting one upload worker thread.")
     while !@shutdown
       file = @file_queue.deq
 
@@ -381,7 +377,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     filename = create_temporary_file(dir, create_ts)
     fd = File.open(filename, "w")
     begin
-      @logger.debug("Ceph: put events into tempfile ", :file => File.basename(fd.path))
+      @logger.debug("Ceph: put events into tempfile ", :file => fd.path)
       while ! events.empty?
         fd.syswrite(format_message(events.pop(non_block = true)))
       end
