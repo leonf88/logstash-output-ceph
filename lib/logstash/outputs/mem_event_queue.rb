@@ -4,7 +4,8 @@ class MemEventQueue
     @partitions = partitions
     @event_queue = Queue.new
     @total_size = 0
-    @begin_ts = Time.now.to_i
+    @begin_ts_time = Time.now
+    @begin_ts = @begin_ts_time.to_i
   end
 
   public
@@ -30,7 +31,7 @@ class MemEventQueue
 
   public
   def begin_ts
-    return @begin_ts
+    return @begin_ts_time
   end
 
   public

@@ -1,7 +1,10 @@
 # encoding: utf-8
 require "logstash/outputs/base"
 require "logstash/namespace"
+#require "logstash/plugin_mixins/aws_config"
+require "logstash/outputs/ceph_helper"
 require "logstash/outputs/mem_event_queue"
+require "securerandom"
 
 # This output will send events to the Ceph storage system.
 # Besides, it provides the buffer store, like Facebook
@@ -28,6 +31,7 @@ require "logstash/outputs/mem_event_queue"
 #    }
 #
 class LogStash::Outputs::Ceph < LogStash::Outputs::Base
+  include LogStash::Outputs::CephHelper
 
   config_name "ceph"
 
@@ -74,30 +78,51 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   # Partition the data before uploading.
   config :partition_fields, :validate => :array, :default=> []
 
-  ######################################
-  # TODO
-  # TCP configuration for debug, should be replaced
-  # by the ceph storage with AWS APIs
-  require("net/http")
-  config :host, :validate => :string, :default => "localhost"
-  config :port, :validate => :number, :default => 80
+  config :bucket, :validate => :string, :required => true
+
+  #######################################
+  # for aws s3, use Aws Sdk for ruby v2
+  def create_bucket(bktname)
+    bucket = @s3.bucket(bktname)
+    if ! bucket.exists?
+      @s3.create_bucket(:bucket => bktname)
+      @logger.debug("Create bucket", :bucket => bktname)
+    end
+  end
+
+  def aws_s3_config
+    @logger.info("Registering s3 output", :bucket => @bucket, :endpoint=> @endpoint)
+    @s3 = Aws::S3::Resource.new(aws_options_hash)
+  end
 
   def upload_file(file)
-    @logger.debug("Ceph: upload #{File.basename(file)}.")
-    Net::HTTP.get(URI("http://#{@host}:#{@port}"))
+    remote_filename = "#{File.basename(file)}"
+
+    @logger.debug("Ceph: ready to write file in bucket", :remote_filename => remote_filename, :bucket => @bucket)
+
+    begin
+      # prepare for write the file
+      # TODO: how about the acl?
+      obj = @s3.bucket(@bucket).object(remote_filename)
+      obj.upload_file(file)
+    rescue AWS::Errors::Base => error
+      @logger.error("Ceph: AWS error", :error => error)
+      raise LogStash::Error, "AWS Configuration Error, #{error}"
+    end
+
+    @logger.debug("Ceph: has written remote file in bucket.", :remote_filename => remote_filename, :bucket  => @bucket)
   end
-  #######################################
 
-  # S3 bucket
-  config :bucket, :validate => :string
-
-  # AWS endpoint_region
-  config :endpoint_region, :validate => [], :deprecated => 'Deprecated, use region instead.'
+  ########################################
 
   # initialize the output
   public
   def register
     require "thread"
+
+    @s3 = aws_s3_config
+
+    create_bucket(@bucket)
 
     @shutdown = false
     # Queue of queue of events to flush to disk.
@@ -352,7 +377,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   private
   def write_to_tempfile(event_q, dir)
     events = event_q.event_queue
-    create_ts = event.begin_ts
+    create_ts = event_q.begin_ts
     filename = create_temporary_file(dir, create_ts)
     fd = File.open(filename, "w")
     begin
@@ -381,7 +406,6 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
   private
   def create_temporary_file(dir, ts)
-    require 'securerandom'
     filename = File.join(dir, "#{ts.strftime("%Y-%m-%dT%H.%M")}_#{SecureRandom.uuid}.#{@file_suffix}")
     @logger.info("Opening file", :path => filename)
 
