@@ -2,6 +2,14 @@
 
 This is a plugin for [Logstash](https://github.com/elastic/logstash).
 
+## Usage
+
+### 1. Build the project 
+
+Provide the build script for the project to generate the gem file, just run
+
+    ./build.sh
+
 ## Documentation
 
 Logstash provides infrastructure to automatically generate documentation for this plugin. We use the asciidoc format to write documentation so any comments in the source code will be first converted into asciidoc and then into html. All plugin documentation are placed under one [central location](http://www.elastic.co/guide/en/logstash/current/).
