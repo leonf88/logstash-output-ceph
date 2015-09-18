@@ -1,12 +1,9 @@
 # encoding: utf-8
 require "logstash/outputs/base"
 require "logstash/namespace"
-#require "logstash/plugin_mixins/aws_config"
 require "logstash/outputs/ceph_helper"
-require "logstash/outputs/mem_event_queue"
 require "securerandom"
-require "json"
-require 'pathname'
+require "pathname"
 
 # This output will send events to the Ceph storage system.
 # Besides, it provides the buffer store, like Facebook
@@ -27,10 +24,20 @@ require 'pathname'
 # [source,ruby]
 # output {
 #    ceph {
-#      temporary_path => "/tmp/logstash"        (optional)
-#      max_items => 50                          (optional)
-#      retry_interval => 5                      (optional)
+#       endpoint => "localhost"                     (required)
+#       access_key_id => "crazy_key"                (required)
+#       secret_access_key => "monkey_access_key"    (required)
+#       upload_root_bucket => "bucket"              (required)
+#       temporary_path => "/tmp/logstash"           (optional)
+#       max_mem_mb => 40                            (optional)
+#       max_disk_mb => 400                          (optional)
+#       seconds_before_new_file => 5 * 60           (optional)
+#       upload_worker_num => 5                      (optional)
+#       retry_interval => 5                         (optional)
+#       message_format => "%{message}"              (optional)
+#       partition_fields => ""                      (optional)
 #    }
+# }
 #
 class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   include LogStash::Outputs::CephHelper
@@ -75,15 +82,12 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   config :file_suffix, :validate => :string, :default => "txt"
 
   # Set the root bucket to upload data.
-  config :upload_root_bucket, :validate => :string, :default=> "data"
+  config :upload_root_bucket, :validate => :string, :default=> "data", :required => true
 
   # Partition the data before uploading.
   config :partition_fields, :validate => :array, :default=> []
 
-  config :bucket, :validate => :string, :required => true
-
-  #######################################
-  # for aws s3, use Aws Sdk for ruby v2
+  # use Aws Sdk v2
   def create_bucket(bktname)
     bucket = @s3.bucket(bktname)
     if ! bucket.exists?
@@ -94,13 +98,12 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
   end
 
   def aws_s3_config
-    @logger.info("Registering s3 output", :bucket => @bucket, :endpoint=> @endpoint)
+    @logger.info("Registering s3 output", :bucket => @upload_root_bucket, :endpoint=> @endpoint)
     @s3 = Aws::S3::Resource.new(aws_options_hash)
   end
 
   private
   def get_remote_bucket_key(local_file)
-    basefile_name = File.basename(local_file)
     relative_path = Pathname.new(local_file).relative_path_from(Pathname.new(@local_file_path))
     return relative_path.to_s
   end
@@ -114,7 +117,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     begin
       # prepare for write the file
       # TODO: how about the acl?
-      obj = @s3.bucket(@bucket).object(remote_bucket_key)
+      obj = @s3.bucket(@upload_root_bucket).object(remote_bucket_key)
       obj.upload_file(local_file)
     rescue AWS::Errors::Base => error
       @logger.error("Ceph: AWS error", :error => error)
@@ -124,8 +127,6 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     @logger.debug("Ceph: has written remote file in bucket.", :remote_bucket_key  => remote_bucket_key)
   end
 
-  ########################################
-
   # initialize the output
   public
   def register
@@ -133,7 +134,7 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
     @s3 = aws_s3_config
 
-    create_bucket(@bucket)
+    create_bucket(@upload_root_bucket)
 
     @shutdown = false
     # Queue of queue of events to flush to disk.
@@ -150,9 +151,6 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
     @total_disk_size = 0
     
     @max_file_size = @max_file_size_mb * 1024 * 1024
-
-    # TODO
-    @file_counter = 0
 
     # A map from partitions to event queue
     @part_to_events = {}
@@ -421,4 +419,47 @@ class LogStash::Outputs::Ceph < LogStash::Outputs::Base
 
     return filename
   end
+end
+
+class MemEventQueue
+
+  def initialize(partitions)
+    @partitions = partitions
+    @event_queue = Queue.new
+    @total_size = 0
+    @begin_ts_time = Time.now
+    @begin_ts = @begin_ts_time.to_i
+  end
+
+  public
+  def partitions
+    return @partitions
+  end
+
+  public
+  def event_queue
+    return @event_queue
+  end
+
+  public
+  def push(event, size)
+    @event_queue << event
+    @total_size += size
+  end
+
+  public
+  def total_size
+    return @total_size
+  end
+
+  public
+  def begin_ts
+    return @begin_ts_time
+  end
+
+  public
+  def seconds_since_first_event()
+    return Time.now.to_i - @begin_ts
+  end
+
 end

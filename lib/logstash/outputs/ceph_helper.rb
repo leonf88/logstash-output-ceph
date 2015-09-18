@@ -1,8 +1,8 @@
+# encoding: utf-8
 require "aws-sdk"
 require "aws-sdk-core"
 
 module LogStash::Outputs::CephHelper
-  # TODO use logstash-plugins/logstash-mixin-aws
 
   US_EAST_1 = "us-east-1"
 
